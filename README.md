@@ -1,11 +1,11 @@
 # MeridusBot
 
-A standalone Discord bot that receives GitHub events via webhooks and sends rich embed notifications to Discord channels. Also communicates with projectmeridus (website) via HTTP APIs.
+A standalone Discord bot that receives GitHub events via webhooks and sends rich embed notifications to Discord channels. Also communicates with the projectmeridus website via HTTP APIs.
 
 ## Features
 
 - **Discord Slash Commands**: `/ping`, `/status`, `/subscribe`, `/unsubscribe`, `/list`, `/test`
-- **GitHub Webhook Integration**: Receives push, pull request, issues, and release events
+- **GitHub Webhook Integration**: Receives push, pull request, issues, release, and other GitHub events
 - **Rich Embed Notifications**: Beautiful Discord embeds for GitHub events
 - **projectmeridus Integration**: API for managing subscriptions from the main website
 
@@ -70,18 +70,31 @@ pm2 start index.js --name meridus-bot
 
 - `/ping` - Check if bot is online
 - `/status` - View bot status and uptime
-- `/subscribe <channel> <repo> [events]` - Subscribe to GitHub events
-- `/unsubscribe <channel> [repo]` - Unsubscribe from events
+- `/subscribe <channel> <repo> [events]` - Subscribe to GitHub repository events
+- `/unsubscribe <channel> [repo]` - Unsubscribe from repository events
 - `/list [channel]` - List subscriptions
 - `/test` - Send a test notification
 
 ## API Endpoints
 
-- `GET /` - Health check
-- `POST /api/discord/interactions` - Discord slash commands
-- `POST /api/webhooks/github` - GitHub webhook receiver
-- `POST /api/subscriptions` - Manage subscriptions (requires API key)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/` | Health check |
+| `GET` | `/api/discord/interactions` | Discord interactions endpoint status |
+| `POST` | `/api/discord/interactions` | Discord slash commands handler |
+| `POST` | `/api/webhooks/github` | GitHub webhook receiver |
+| `POST` | `/api/subscriptions` | Manage subscriptions (requires API key) |
+
+## Supported GitHub Events
+
+- `push` - Push commits
+- `pull_request` - Pull request opened, closed, merged
+- `issues` - Issue opened, closed, edited
+- `release` - Release published
+- `fork` - Repository forked
+- `create` - Branch or tag created
+- `delete` - Branch or tag deleted
 
 ## License
 
-MIT
+MIT License - Copyright (c) 2026 Boripat Kunla
