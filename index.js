@@ -8,7 +8,7 @@
  */
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, REST, Routes, ActivityType } = require('discord.js');
+const { Client, Intents, Routes } = require('discord.js');
 const express = require('express');
 const crypto = require('crypto');
 
@@ -30,9 +30,9 @@ const {
 // Create Discord client
 const client = new Client({
     intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
+        Intents.FLAGS.GUILDS,
+        Intents.FLAGS.GUILD_MESSAGES,
+        Intents.FLAGS.MESSAGE_CONTENT,
     ],
 });
 
@@ -69,31 +69,13 @@ app.get('/api/discord/interactions', (req, res) => {
 app.post('/api/discord/interactions', async (req, res) => {
     const { type, data, token } = req.body;
     
-    // Handle PING (Discord verification)
+    // Handle PING (Discord verification) - Required for Interaction Endpoint URL
     if (type === 1) {
         return res.json({ type: 1 });
     }
     
-    // Handle slash commands
-    if (type === 2) {
-        const commandName = data?.name;
-        const options = data?.options || [];
-        
-        console.log(`[Interactions] Command: ${commandName}`);
-        
-        try {
-            const response = await handleSlashCommand(commandName, options, req, res);
-            if (response) {
-                return res.json(response);
-            }
-        } catch (error) {
-            console.error('[Interactions] Error:', error);
-            return res.json({
-                type: 4,
-                data: { content: `❌ Error: ${error.message}` }
-            });
-        }
-    }
+    // Slash commands are handled by the Gateway event (client.on('interactionCreate'))
+    // Do NOT handle them here to avoid double-reply errors
     
     return res.json({ type: 5 });
 });
@@ -522,7 +504,7 @@ client.once('ready', async () => {
     // Set bot activity
     client.user.setActivity({
         name: 'GitHub Repositories',
-        type: ActivityType.Watching,
+        type: 'WATCHING',
     });
     
     // Register slash commands
@@ -596,11 +578,7 @@ client.once('ready', async () => {
     ];
     
     try {
-        const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
-        await rest.put(
-            Routes.applicationCommands(DISCORD_APP_ID),
-            { body: commands }
-        );
+        await client.application.commands.set(commands);
         console.log('[Discord] Slash commands registered');
     } catch (err) {
         console.error('[Discord] Failed to register commands:', err);
