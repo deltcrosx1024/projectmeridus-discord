@@ -36,9 +36,9 @@ const {
 // Create Discord client
 const client = new Client({
     intents: [
-        Intents.FLAGS.GUILDS,
-        Intents.FLAGS.GUILD_MESSAGES,
-        Intents.FLAGS.MESSAGE_CONTENT,
+        3276799, // All intents except GUILD_PRESENCES and GUILD_MEMBERS (to avoid privileged intents)
+        Intents.FLAGS.GUILD_PRESENCES,
+        Intents.FLAGS.GUILD_MEMBERS,
     ],
 });
 
