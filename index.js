@@ -15,6 +15,12 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
+// Helper to get base URL from MERIDUS_URL
+function getBaseUrl() {
+    if (!MERIDUS_URL) return 'https://www.meridusdev.in.th';
+    return MERIDUS_URL.replace('/api/auth/callback?service=discord', '');
+}
+
 // Configuration
 const {
     DISCORD_BOT_TOKEN,
@@ -30,9 +36,9 @@ const {
 // Create Discord client
 const client = new Client({
     intents: [
-        Intents.FLAGS.GUILDS,
-        Intents.FLAGS.GUILD_MESSAGES,
-        Intents.FLAGS.MESSAGE_CONTENT,
+        3276799, // All intents except GUILD_PRESENCES and GUILD_MEMBERS (to avoid privileged intents)
+        Intents.FLAGS.GUILD_PRESENCES,
+        Intents.FLAGS.GUILD_MEMBERS,
     ],
 });
 
@@ -58,27 +64,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// Discord Interactions Endpoint
-app.get('/api/discord/interactions', (req, res) => {
-    res.json({
-        status: 'ok',
-        message: 'Discord interactions endpoint is active',
-    });
-});
-
-app.post('/api/discord/interactions', async (req, res) => {
-    const { type, data, token } = req.body;
-    
-    // Handle PING (Discord verification) - Required for Interaction Endpoint URL
-    if (type === 1) {
-        return res.json({ type: 1 });
-    }
-    
-    // Slash commands are handled by the Gateway event (client.on('interactionCreate'))
-    // Do NOT handle them here to avoid double-reply errors
-    
-    return res.json({ type: 5 });
-});
+// Discord Interactions are now handled by the website at /api/discord/interactions
 
 // GitHub Webhook Receiver (from projectmeridus)
 app.post('/api/webhooks/github', (req, res) => {
@@ -154,6 +140,42 @@ app.post('/api/subscriptions', async (req, res) => {
     }
 });
 
+// Status endpoint - combines bot status with website status
+app.get('/api/status', async (req, res) => {
+    const botStatus = {
+        connected: botState.connected,
+        uptime: Math.floor((Date.now() - botState.startTime) / 1000),
+        subscriptions: botState.subscriptions.size,
+    };
+    
+    let websiteStatus = null;
+    let websiteError = null;
+    
+    if (MERIDUS_URL && MERIDUS_API_KEY) {
+            const baseUrl = getBaseUrl();
+        try {
+            const response = await fetch(`${baseUrl}/api/meridus/status`, {
+                headers: {
+                    'x-api-key': MERIDUS_API_KEY,
+                },
+            });
+            if (response.ok) {
+                websiteStatus = await response.json();
+            } else {
+                websiteError = `HTTP ${response.status}`;
+            }
+        } catch (err) {
+            websiteError = err.message;
+        }
+    }
+    
+    res.json({
+        bot: botStatus,
+        website: websiteStatus,
+        websiteError: websiteError,
+    });
+});
+
 // ============================================
 // Command Handlers
 // ============================================
@@ -182,6 +204,15 @@ async function handleSlashCommand(commandName, options, req, res) {
             
         case 'test':
             return await handleTestCommand(args);
+            
+        case 'repos':
+            return await handleReposCommand(args);
+            
+        case 'issues':
+            return await handleIssuesCommand(args);
+            
+        case 'commits':
+            return await handleCommitsCommand(args);
             
         default:
             return {
@@ -347,6 +378,185 @@ async function handleTestCommand(args) {
             }]
         }
     };
+}
+
+async function handleReposCommand(args) {
+    if (!MERIDUS_URL || !MERIDUS_API_KEY) {
+        return {
+            type: 4,
+            data: { content: '❌ MERIDUS_URL or MERIDUS_API_KEY not configured' }
+        };
+    }
+    
+    const baseUrl = getBaseUrl();
+    
+    try {
+        const response = await fetch(`${baseUrl}/api/github/repos`, {
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+            },
+        });
+        
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ Error fetching repos: HTTP ${response.status}` }
+            };
+        }
+        
+        const repos = await response.json();
+        
+        if (!Array.isArray(repos) || repos.length === 0) {
+            return {
+                type: 4,
+                data: { content: '📭 No repositories found' }
+            };
+        }
+        
+        const repoList = repos.slice(0, 10).map(r => 
+            `[${r.full_name}](${r.html_url}) - ⭐ ${r.stargazers_count || 0}`
+        ).join('\n');
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '📚 GitHub Repositories',
+                    color: 0x238636,
+                    description: repoList,
+                    footer: { text: `Showing ${Math.min(repos.length, 10)} of ${repos.length} repos` },
+                    timestamp: new Date().toISOString(),
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+async function handleIssuesCommand(args) {
+    if (!MERIDUS_URL || !MERIDUS_API_KEY) {
+        return {
+            type: 4,
+            data: { content: '❌ MERIDUS_URL or MERIDUS_API_KEY not configured' }
+        };
+    }
+    
+    const baseUrl = getBaseUrl();
+    const repo = args.repo;
+    const url = repo 
+        ? `${baseUrl}/api/github/issues?repo=${encodeURIComponent(repo)}`
+        : `${baseUrl}/api/github/issues`;
+    
+    try {
+        const response = await fetch(url, {
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+            },
+        });
+        
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ Error fetching issues: HTTP ${response.status}` }
+            };
+        }
+        
+        const issues = await response.json();
+        
+        if (!Array.isArray(issues) || issues.length === 0) {
+            return {
+                type: 4,
+                data: { content: '📭 No issues found' }
+            };
+        }
+        
+        const issueList = issues.slice(0, 10).map(i => 
+            `[#${i.number}](${i.html_url}) ${i.state === 'open' ? '🟢' : '🔴'} ${i.title.substring(0, 60)}`
+        ).join('\n');
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '📋 GitHub Issues',
+                    color: 0xF85149,
+                    description: issueList,
+                    footer: { text: `Showing ${Math.min(issues.length, 10)} of ${issues.length} issues` },
+                    timestamp: new Date().toISOString(),
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+async function handleCommitsCommand(args) {
+    if (!MERIDUS_URL || !MERIDUS_API_KEY) {
+        return {
+            type: 4,
+            data: { content: '❌ MERIDUS_URL or MERIDUS_API_KEY not configured' }
+        };
+    }
+    
+    const baseUrl = getBaseUrl();
+    const repo = args.repo;
+    const url = repo 
+        ? `${baseUrl}/api/github/commits?repo=${encodeURIComponent(repo)}`
+        : `${baseUrl}/api/github/commits`;
+    
+    try {
+        const response = await fetch(url, {
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+            },
+        });
+        
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ Error fetching commits: HTTP ${response.status}` }
+            };
+        }
+        
+        const commits = await response.json();
+        
+        if (!Array.isArray(commits) || commits.length === 0) {
+            return {
+                type: 4,
+                data: { content: '📭 No commits found' }
+            };
+        }
+        
+        const commitList = commits.slice(0, 10).map(c => 
+            `[\`${c.sha.substring(0, 7)}\`](${c.html_url}) ${c.commit.message.split('\n')[0].substring(0, 50)} - ${c.commit.author.name}`
+        ).join('\n');
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '📤 Recent Commits',
+                    color: 0x238636,
+                    description: commitList,
+                    footer: { text: `Showing ${Math.min(commits.length, 10)} of ${commits.length} commits` },
+                    timestamp: new Date().toISOString(),
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
 }
 
 // ============================================
@@ -574,6 +784,34 @@ client.once('ready', async () => {
         {
             name: 'test',
             description: 'Send a test notification',
+        },
+        {
+            name: 'repos',
+            description: 'List GitHub repositories',
+        },
+        {
+            name: 'issues',
+            description: 'List GitHub issues',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: false,
+                },
+            ],
+        },
+        {
+            name: 'commits',
+            description: 'List recent commits',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: false,
+                },
+            ],
         },
     ];
     
