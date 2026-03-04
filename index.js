@@ -30,8 +30,18 @@ const {
     PORT = 3000,
     MERIDUS_URL,
     MERIDUS_API_KEY,
-    GITHUB_WEBHOOK_SECRET
+    GITHUB_WEBHOOK_SECRET,
+    GITHUB_TOKEN
 } = process.env;
+
+// Embed color constants
+const EmbedColors = {
+    SUCCESS: 0x238636,   // Green
+    ERROR: 0xF85149,     // Red
+    INFO: 0x8257E5,      // Purple
+    WARNING: 0xE3B341,   // Orange/Yellow
+    GITHUB: 0x6E7681,    // Dark Gray
+};
 
 // Create Discord client
 const client = new Client({
@@ -180,9 +190,26 @@ app.get('/api/status', async (req, res) => {
 // Command Handlers
 // ============================================
 
-async function handleSlashCommand(commandName, options, req, res) {
+async function handleSlashCommand(commandName, options, req, res, interaction = null) {
+    console.log(`[handleSlashCommand] Received commandName: "${commandName}" (type: ${typeof commandName})`);
     const args = parseOptions(options);
-    
+
+    // Handle subcommands for 'repo' and 'webhook'
+    const subcommand = options.find(opt => opt.type === 1 || opt.type === 2);
+    if (subcommand) {
+        args.subcommand = subcommand.name;
+        // Merge subcommand options into args
+        if (subcommand.options) {
+            for (const opt of subcommand.options) {
+                args[opt.name] = opt.value;
+            }
+        }
+    }
+
+    // Get user ID from interaction if available
+    const userId = interaction?.user?.id || null;
+    args.userId = userId;
+
     switch (commandName) {
         case 'ping':
             return {
@@ -214,7 +241,70 @@ async function handleSlashCommand(commandName, options, req, res) {
         case 'commits':
             return await handleCommitsCommand(args);
             
+        // NEW COMMANDS
+        case 'repo':
+            if (args.subcommand === 'info') {
+                return await handleRepoInfoCommand(args);
+            }
+            return {
+                type: 4,
+                data: { content: '❌ Unknown subcommand. Use: /repo info' }
+            };
+            
+        case 'pr':
+            return await handlePRCommand(args);
+            
+        case 'star':
+            return await handleStarCommand(args);
+            
+        case 'watch':
+            return await handleWatchCommand(args);
+            
+        case 'webhook':
+            return await handleWebhookCommand(args);
+            
+        case 'merge':
+            return await handleMergeCommand(args);
+            
+        case 'search':
+            return await handleSearchCommand(args);
+            
+        // PROJECTMERIDUS INTEGRATION COMMANDS
+        case 'issue':
+            if (args.subcommand === 'create') {
+                return await handleIssueCreateCommand(args, userId);
+            }
+            return await handleIssuesCommand(args);
+
+        case 'release':
+            return await handleReleaseCommand(args);
+
+        case 'branch':
+            return await handleBranchCommand(args);
+
+        case 'contributors':
+            return await handleContributorsCommand(args);
+
+        case 'workflow':
+            return await handleWorkflowCommand(args);
+
+        case 'user':
+            if (args.subcommand === 'link') {
+                return await handleUserLinkCommand(args);
+            } else if (args.subcommand === 'unlink') {
+                return await handleUserUnlinkCommand(args);
+            } else if (args.subcommand === 'status') {
+                return await handleUserStatusCommand(args);
+            }
+            return {
+                type: 4,
+                data: { content: '❌ Unknown subcommand. Use: /user link, /user unlink, /user status' }
+            };
+
         default:
+            console.log(`[DEBUG] Unknown command received: "${commandName}"`);
+            console.log(`[DEBUG] Command name length: ${commandName.length}`);
+            console.log(`[DEBUG] Command name chars:`, [...commandName].map(c => c.charCodeAt(0)));
             return {
                 type: 4,
                 data: { content: `❌ Unknown command: ${commandName}` }
@@ -560,6 +650,1739 @@ async function handleCommitsCommand(args) {
 }
 
 // ============================================
+// NEW COMMAND HANDLERS
+// ============================================
+
+// Helper to get GitHub token for user from projectmeridus database
+async function getGitHubToken(discordUserId = null) {
+    // If no discord user ID, fall back to server token
+    if (!discordUserId || !MERIDUS_URL || !MERIDUS_API_KEY) {
+        return GITHUB_TOKEN;
+    }
+
+    try {
+        const baseUrl = getBaseUrl();
+        const response = await fetch(`${baseUrl}/api/user/github-token?discordId=${discordUserId}`, {
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+                'Accept': 'application/json',
+            },
+        });
+
+        if (!response.ok) {
+            console.log(`[getGitHubToken] Failed to fetch token for ${discordUserId}: HTTP ${response.status}`);
+            return GITHUB_TOKEN; // Fall back to server token
+        }
+
+        const data = await response.json();
+        if (data.token) {
+            console.log(`[getGitHubToken] Retrieved token for Discord user ${discordUserId}`);
+            return data.token;
+        }
+
+        return GITHUB_TOKEN; // Fall back to server token if no user token
+    } catch (err) {
+        console.error(`[getGitHubToken] Error fetching token: ${err.message}`);
+        return GITHUB_TOKEN; // Fall back to server token on error
+    }
+}
+
+// Helper to link Discord user with projectmeridus account
+async function linkDiscordUser(discordUserId, githubToken, metadata = {}) {
+    if (!MERIDUS_URL || !MERIDUS_API_KEY) {
+        return { ok: false, message: 'MERIDUS_URL or MERIDUS_API_KEY not configured' };
+    }
+
+    try {
+        const baseUrl = getBaseUrl();
+        const response = await fetch(`${baseUrl}/api/user/link`, {
+            method: 'POST',
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                discordId: discordUserId,
+                githubToken: githubToken,
+                metadata: metadata,
+            }),
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            return { 
+                ok: false, 
+                message: error.message || `HTTP ${response.status}` 
+            };
+        }
+
+        const data = await response.json();
+        return { ok: true, data };
+    } catch (err) {
+        console.error(`[linkDiscordUser] Error: ${err.message}`);
+        return { ok: false, message: err.message };
+    }
+}
+
+// Helper to unlink Discord user from projectmeridus
+async function unlinkDiscordUser(discordUserId) {
+    if (!MERIDUS_URL || !MERIDUS_API_KEY) {
+        return { ok: false, message: 'MERIDUS_URL or MERIDUS_API_KEY not configured' };
+    }
+
+    try {
+        const baseUrl = getBaseUrl();
+        const response = await fetch(`${baseUrl}/api/user/unlink?discordId=${discordUserId}`, {
+            method: 'DELETE',
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+            },
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            return { 
+                ok: false, 
+                message: error.message || `HTTP ${response.status}` 
+            };
+        }
+
+        return { ok: true };
+    } catch (err) {
+        console.error(`[unlinkDiscordUser] Error: ${err.message}`);
+        return { ok: false, message: err.message };
+    }
+}
+
+// Helper to check if Discord user is linked
+async function isDiscordUserLinked(discordUserId) {
+    if (!MERIDUS_URL || !MERIDUS_API_KEY) {
+        return false;
+    }
+
+    try {
+        const baseUrl = getBaseUrl();
+        const response = await fetch(`${baseUrl}/api/user/status?discordId=${discordUserId}`, {
+            headers: {
+                'x-api-key': MERIDUS_API_KEY,
+            },
+        });
+
+        if (!response.ok) {
+            return false;
+        }
+
+        const data = await response.json();
+        return data.linked === true;
+    } catch (err) {
+        console.error(`[isDiscordUserLinked] Error: ${err.message}`);
+        return false;
+    }
+}
+
+// Helper to parse owner/repo from input
+function parseRepoInput(input) {
+    const parts = input.split('/');
+    if (parts.length !== 2) return null;
+    return { owner: parts[0], repo: parts[1] };
+}
+
+// Format number with commas
+function formatNumber(num) {
+    return num?.toLocaleString() || '0';
+}
+
+// Format date
+function formatDate(dateStr) {
+    if (!dateStr) return 'Unknown';
+    const date = new Date(dateStr);
+    return date.toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric' 
+    });
+}
+
+// /repo info command handler
+async function handleRepoInfoCommand(args) {
+    const repoInput = args.repo;
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured. Please set GITHUB_TOKEN.' }
+        };
+    }
+
+    try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (response.status === 401) {
+            return {
+                type: 4,
+                data: { content: '🔒 GitHub token expired or invalid.' }
+            };
+        }
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+            };
+        }
+
+        const data = await response.json();
+
+        const fields = [
+            { name: '⭐ Stars', value: formatNumber(data.stargazers_count), inline: true },
+            { name: '🍴 Forks', value: formatNumber(data.forks_count), inline: true },
+            { name: '👁️ Watchers', value: formatNumber(data.watchers_count), inline: true },
+            { name: '📋 Open Issues', value: formatNumber(data.open_issues_count), inline: true },
+            { name: '💻 Language', value: data.language || 'Not specified', inline: true },
+            { name: '📅 Created', value: formatDate(data.created_at), inline: true },
+            { name: '🔄 Updated', value: formatDate(data.updated_at), inline: true },
+        ];
+
+        if (data.license) {
+            fields.push({ name: '📄 License', value: data.license.name, inline: true });
+        }
+
+        if (data.homepage) {
+            fields.push({ name: '🌐 Homepage', value: `[Visit](${data.homepage})`, inline: true });
+        }
+
+        if (data.topics && data.topics.length > 0) {
+            fields.push({ 
+                name: '🏷️ Topics', 
+                value: data.topics.slice(0, 10).map(t => `\`${t}\``).join(', ') 
+            });
+        }
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `📦 ${data.full_name}`,
+                    description: data.description || 'No description available',
+                    url: data.html_url,
+                    color: EmbedColors.INFO,
+                    fields: fields,
+                    thumbnail: { url: data.owner?.avatar_url },
+                    timestamp: new Date().toISOString(),
+                    footer: { text: `Default branch: ${data.default_branch}` }
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /pr command handler
+async function handlePRCommand(args) {
+    const repoInput = args.repo;
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=10`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+            };
+        }
+
+        const prs = await response.json();
+
+        if (prs.length === 0) {
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: `🔀 Open Pull Requests: ${owner}/${repo}`,
+                        description: '🎉 No open pull requests!',
+                        color: EmbedColors.SUCCESS,
+                        url: `https://github.com/${owner}/${repo}/pulls`
+                    }]
+                }
+            };
+        }
+
+        const prList = prs.map(pr => {
+            const emoji = pr.draft ? '🟡' : (pr.state === 'open' ? '🟢' : '🔴');
+            const labels = pr.labels?.length > 0 
+                ? pr.labels.map(l => `\`${l.name}\``).join(' ') 
+                : '';
+            const reviewStatus = pr.requested_reviewers?.length > 0 
+                ? `👥 ${pr.requested_reviewers.length} reviewers` 
+                : '';
+            return `${emoji} [#${pr.number}](${pr.html_url}) **${pr.title.substring(0, 60)}${pr.title.length > 60 ? '...' : ''}**\n` +
+                   `   By **${pr.user.login}** • ${formatDate(pr.created_at)}${labels ? ' • ' + labels : ''}${reviewStatus ? ' • ' + reviewStatus : ''}`;
+        }).join('\n\n');
+
+        const linkToMore = prs.length >= 10 
+            ? `\n\n[View all pull requests](https://github.com/${owner}/${repo}/pulls)` 
+            : '';
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `🔀 Open Pull Requests: ${owner}/${repo}`,
+                    description: prList + linkToMore,
+                    color: EmbedColors.INFO,
+                    footer: { text: `Showing ${prs.length} open PRs` },
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /star command handler
+async function handleStarCommand(args) {
+    const repoInput = args.repo;
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        // Star the repository
+        const starResponse = await fetch(`https://api.github.com/user/starred/${owner}/${repo}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0',
+                'Content-Length': '0'
+            }
+        });
+
+        if (starResponse.status === 401) {
+            return {
+                type: 4,
+                data: { content: '🔒 GitHub token expired or lacks permissions (needs `public_repo` or `repo` scope).' }
+            };
+        }
+
+        if (starResponse.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (starResponse.status === 204 || starResponse.status === 304) {
+            // Get updated star count
+            const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                    'User-Agent': 'MeridusBot/1.0'
+                }
+            });
+            
+            let starCount = 'unknown';
+            if (repoResponse.ok) {
+                const repoData = await repoResponse.json();
+                starCount = formatNumber(repoData.stargazers_count);
+            }
+
+            const alreadyStarred = starResponse.status === 304;
+
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: alreadyStarred ? '⭐ Already Starred' : '⭐ Repository Starred!',
+                        description: alreadyStarred 
+                            ? `You already starred **${owner}/${repo}**`
+                            : `Successfully starred **${owner}/${repo}**`,
+                        color: EmbedColors.WARNING,
+                        fields: [
+                            { name: 'Total Stars', value: `⭐ ${starCount}`, inline: true },
+                            { name: 'Repository', value: `[View on GitHub](https://github.com/${owner}/${repo})`, inline: true }
+                        ],
+                        timestamp: new Date().toISOString()
+                    }]
+                }
+            };
+        }
+
+        return {
+            type: 4,
+            data: { content: `❌ Failed to star repository. Status: ${starResponse.status}` }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /watch command handler
+async function handleWatchCommand(args) {
+    const repoInput = args.repo;
+    const action = args.action || 'toggle';
+    
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        // Get current subscription status
+        const subResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/subscription`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        let currentlySubscribed = false;
+        if (subResponse.ok) {
+            const subData = await subResponse.json();
+            currentlySubscribed = subData.subscribed;
+        }
+
+        // Determine new state
+        let newState;
+        if (action === 'subscribe' || action === 'watch') {
+            newState = true;
+        } else if (action === 'unsubscribe' || action === 'unwatch') {
+            newState = false;
+        } else {
+            // toggle
+            newState = !currentlySubscribed;
+        }
+
+        // Set subscription
+        const updateResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/subscription`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                subscribed: newState,
+                ignored: false
+            })
+        });
+
+        if (updateResponse.status === 401) {
+            return {
+                type: 4,
+                data: { content: '🔒 GitHub token expired or lacks permissions.' }
+            };
+        }
+
+        if (updateResponse.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        const statusText = newState ? '👁️ Watching' : '🚫 Not Watching';
+        const color = newState ? EmbedColors.SUCCESS : EmbedColors.WARNING;
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `${statusText}: ${owner}/${repo}`,
+                    description: newState 
+                        ? `You are now watching **${owner}/${repo}**. You'll receive notifications for this repository.`
+                        : `You are no longer watching **${owner}/${repo}**. Notifications disabled.`,
+                    color: color,
+                    fields: [
+                        { 
+                            name: 'Previous Status', 
+                            value: currentlySubscribed ? '👁️ Watching' : '🚫 Not Watching', 
+                            inline: true 
+                        },
+                        { 
+                            name: 'Current Status', 
+                            value: statusText, 
+                            inline: true 
+                        }
+                    ],
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /webhook command handler
+async function handleWebhookCommand(args) {
+    const repoInput = args.repo;
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/hooks`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (response.status === 403) {
+            return {
+                type: 4,
+                data: { content: '🔒 Insufficient permissions to view webhooks.' }
+            };
+        }
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+            };
+        }
+
+        const webhooks = await response.json();
+        
+        // Check if Meridus webhook is configured
+        const baseUrl = getBaseUrl();
+        const meridusWebhookUrl = `${baseUrl}/api/webhooks/github`;
+        const meridusWebhook = webhooks.find(h => 
+            h.config?.url?.includes('meridus') || 
+            h.config?.url === meridusWebhookUrl
+        );
+
+        if (webhooks.length === 0) {
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: `🔗 Webhook Status: ${owner}/${repo}`,
+                        description: '❌ No webhooks configured for this repository.',
+                        color: EmbedColors.WARNING,
+                        fields: [
+                            { name: 'Setup Required', value: `[Configure webhooks](https://github.com/${owner}/${repo}/settings/hooks)` }
+                        ]
+                    }]
+                }
+            };
+        }
+
+        const webhookList = webhooks.map(h => {
+            const isActive = h.active ? '🟢' : '🔴';
+            const isMeridus = h === meridusWebhook ? ' ✨ (Meridus)' : '';
+            const events = h.events?.slice(0, 5).join(', ') + (h.events?.length > 5 ? '...' : '');
+            return `${isActive} **${h.name}**${isMeridus}\n   Events: ${events || 'None'}`;
+        }).join('\n\n');
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `🔗 Webhook Status: ${owner}/${repo}`,
+                    description: webhookList,
+                    color: meridusWebhook ? EmbedColors.SUCCESS : EmbedColors.WARNING,
+                    fields: [
+                        { 
+                            name: 'Meridus Webhook', 
+                            value: meridusWebhook ? '✅ Configured' : '❌ Not found\nExpected URL: `' + meridusWebhookUrl + '`', 
+                            inline: false 
+                        },
+                        { 
+                            name: 'Total Webhooks', 
+                            value: `${webhooks.length}`, 
+                            inline: true 
+                        }
+                    ],
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /merge command handler
+async function handleMergeCommand(args) {
+    const repoInput = args.repo;
+    const prNumber = args.number;
+    const method = args.method || 'merge';
+    
+    if (!repoInput || !prNumber) {
+        return {
+            type: 4,
+            data: { content: '❌ Usage: /merge <repo> <number> [method]' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    // Validate merge method
+    const validMethods = ['merge', 'squash', 'rebase'];
+    if (!validMethods.includes(method)) {
+        return {
+            type: 4,
+            data: { content: `❌ Invalid merge method. Use: merge, squash, or rebase` }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        // First, get PR details to show in response
+        const prResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (prResponse.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Pull request not found.' }
+            };
+        }
+
+        if (!prResponse.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ Failed to fetch PR: HTTP ${prResponse.status}` }
+            };
+        }
+
+        const prData = await prResponse.json();
+
+        if (prData.state !== 'open') {
+            return {
+                type: 4,
+                data: { content: `❌ PR #${prNumber} is already ${prData.state}.` }
+            };
+        }
+
+        // Attempt merge
+        const mergeResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                commit_title: `Merge pull request #${prNumber} from ${prData.head.ref}`,
+                merge_method: method
+            })
+        });
+
+        const mergeData = await mergeResponse.json();
+
+        if (mergeResponse.status === 405) {
+            return {
+                type: 4,
+                data: { content: `❌ PR #${prNumber} cannot be merged. It may have conflicts or not be mergeable.` }
+            };
+        }
+
+        if (mergeResponse.status === 409) {
+            return {
+                type: 4,
+                data: { content: `❌ PR #${prNumber} has merge conflicts that must be resolved first.` }
+            };
+        }
+
+        if (!mergeResponse.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ Merge failed: ${mergeData.message || 'Unknown error'}` }
+            };
+        }
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '✅ Pull Request Merged',
+                    description: `[#${prNumber}](${prData.html_url}) **${prData.title}**`,
+                    color: EmbedColors.SUCCESS,
+                    fields: [
+                        { name: 'Method', value: method.charAt(0).toUpperCase() + method.slice(1), inline: true },
+                        { name: 'Author', value: prData.user.login, inline: true },
+                        { name: 'Commit SHA', value: `\`${mergeData.sha?.substring(0, 7) || 'N/A'}\``, inline: true },
+                        { name: 'Branch', value: `${prData.head.ref} → ${prData.base.ref}`, inline: false }
+                    ],
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /search command handler
+async function handleSearchCommand(args) {
+    const query = args.query;
+    const type = args.type || 'repos';
+    
+    if (!query) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a search query' }
+        };
+    }
+
+    const validTypes = ['repos', 'issues', 'code', 'users', 'commits'];
+    if (!validTypes.includes(type)) {
+        return {
+            type: 4,
+            data: { content: `❌ Invalid search type. Use: repos, issues, code, users, or commits` }
+        };
+    }
+
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        let endpoint, title, color, resultFormatter;
+        
+        switch (type) {
+            case 'repos':
+                endpoint = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=5`;
+                title = '🔍 Repository Search';
+                color = EmbedColors.INFO;
+                resultFormatter = (item) => {
+                    return `[${item.full_name}](${item.html_url}) ⭐ ${formatNumber(item.stargazers_count)}\n` +
+                           `   ${item.description?.substring(0, 80) || 'No description'}${item.description?.length > 80 ? '...' : ''}`;
+                };
+                break;
+                
+            case 'issues':
+                endpoint = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=5`;
+                title = '🔍 Issue Search';
+                color = EmbedColors.ERROR;
+                resultFormatter = (item) => {
+                    const emoji = item.state === 'open' ? '🟢' : '🔴';
+                    return `${emoji} [#${item.number}](${item.html_url}) ${item.title.substring(0, 60)}${item.title.length > 60 ? '...' : ''}\n` +
+                           `   in **${item.repository_url?.split('/').pop() || 'unknown'}** by ${item.user?.login || 'unknown'}`;
+                };
+                break;
+                
+            case 'code':
+                endpoint = `https://api.github.com/search/code?q=${encodeURIComponent(query)}&per_page=5`;
+                title = '🔍 Code Search';
+                color = EmbedColors.SUCCESS;
+                resultFormatter = (item) => {
+                    return `[${item.name}](${item.html_url})\n` +
+                           `   in **${item.repository?.full_name || 'unknown'}**`;
+                };
+                break;
+                
+            case 'users':
+                endpoint = `https://api.github.com/search/users?q=${encodeURIComponent(query)}&per_page=5`;
+                title = '🔍 User Search';
+                color = EmbedColors.WARNING;
+                resultFormatter = (item) => {
+                    return `[${item.login}](${item.html_url}) ${item.type}\n` +
+                           `   [Profile](${item.html_url})`;
+                };
+                break;
+                
+            case 'commits':
+                endpoint = `https://api.github.com/search/commits?q=${encodeURIComponent(query)}&per_page=5`;
+                title = '🔍 Commit Search';
+                color = EmbedColors.GITHUB;
+                resultFormatter = (item) => {
+                    return `[\`${item.sha?.substring(0, 7) || 'N/A'}\`](${item.html_url}) ${item.commit?.message?.split('\n')[0]?.substring(0, 50) || 'No message'}${item.commit?.message?.length > 50 ? '...' : ''}\n` +
+                           `   by **${item.commit?.author?.name || item.author?.login || 'unknown'}** in ${item.repository?.full_name || 'unknown'}`;
+                };
+                break;
+        }
+
+        const response = await fetch(endpoint, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': type === 'commits' ? 'application/vnd.github.cloak-preview+json' : 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ Search failed: HTTP ${response.status}` }
+            };
+        }
+
+        const data = await response.json();
+        const items = data.items || [];
+
+        if (items.length === 0) {
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: title,
+                        description: `No results found for "**${query}**"`,
+                        color: EmbedColors.WARNING
+                    }]
+                }
+            };
+        }
+
+        const resultsList = items.map(resultFormatter).join('\n\n');
+        const githubSearchUrl = `https://github.com/search?q=${encodeURIComponent(query)}&type=${type}`;
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: title,
+                    description: resultsList,
+                    color: color,
+                    fields: [
+                        { name: 'Total Results', value: formatNumber(data.total_count), inline: true },
+                        { name: 'View All', value: `[Search on GitHub](${githubSearchUrl})`, inline: true }
+                    ],
+                    footer: { text: `Showing top ${items.length} results` },
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /user link command handler
+async function handleUserLinkCommand(args) {
+    const userId = args.userId;
+    const token = args.token;
+
+    if (!userId) {
+        return {
+            type: 4,
+            data: { content: '❌ Unable to identify user.' }
+        };
+    }
+
+    if (!token) {
+        // Check if already linked
+        const isLinked = await isDiscordUserLinked(userId);
+        if (isLinked) {
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: '✅ Account Linked',
+                        description: 'Your Discord account is already linked to projectmeridus.',
+                        color: EmbedColors.SUCCESS,
+                        fields: [
+                            { name: 'Discord ID', value: userId, inline: true },
+                            { name: 'Status', value: '🟢 Active', inline: true },
+                        ],
+                        footer: { text: 'Use /user unlink to remove the link' }
+                    }]
+                }
+            };
+        }
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '🔗 Link Your Account',
+                    description: 'To link your Discord account with projectmeridus, visit the website and authorize GitHub access.',
+                    color: EmbedColors.INFO,
+                    fields: [
+                        { name: 'Step 1', value: `Visit [Meridus](${getBaseUrl()}) and login with GitHub`, inline: false },
+                        { name: 'Step 2', value: 'Go to Settings → Discord Integration', inline: false },
+                        { name: 'Step 3', value: `Connect your Discord account (ID: \`${userId}\`)`, inline: false },
+                    ],
+                    footer: { text: 'Your GitHub token will be securely stored' }
+                }]
+            }
+        };
+    }
+
+    // Link with provided token (for admin/debug purposes)
+    const result = await linkDiscordUser(userId, token, {
+        linkedAt: new Date().toISOString(),
+        source: 'discord_bot'
+    });
+
+    if (!result.ok) {
+        return {
+            type: 4,
+            data: { content: `❌ Failed to link account: ${result.message}` }
+        };
+    }
+
+    return {
+        type: 4,
+        data: {
+            embeds: [{
+                title: '✅ Account Linked Successfully',
+                description: 'Your Discord account is now linked to projectmeridus.',
+                color: EmbedColors.SUCCESS,
+                fields: [
+                    { name: 'Discord ID', value: userId, inline: true },
+                    { name: 'Status', value: '🟢 Active', inline: true },
+                    { name: 'Next Steps', value: 'Use GitHub commands with your personal token!' },
+                ],
+                timestamp: new Date().toISOString()
+            }]
+        }
+    };
+}
+
+// /user unlink command handler
+async function handleUserUnlinkCommand(args) {
+    const userId = args.userId;
+
+    if (!userId) {
+        return {
+            type: 4,
+            data: { content: '❌ Unable to identify user.' }
+        };
+    }
+
+    const isLinked = await isDiscordUserLinked(userId);
+    if (!isLinked) {
+        return {
+            type: 4,
+            data: { content: 'ℹ️ Your Discord account is not linked to projectmeridus.' }
+        };
+    }
+
+    const result = await unlinkDiscordUser(userId);
+
+    if (!result.ok) {
+        return {
+            type: 4,
+            data: { content: `❌ Failed to unlink account: ${result.message}` }
+        };
+    }
+
+    return {
+        type: 4,
+        data: {
+            embeds: [{
+                title: '✅ Account Unlinked',
+                description: 'Your Discord account has been unlinked from projectmeridus.',
+                color: EmbedColors.WARNING,
+                fields: [
+                    { name: 'Discord ID', value: userId, inline: true },
+                    { name: 'Status', value: '🔴 Unlinked', inline: true },
+                ],
+                footer: { text: 'Use /user link to reconnect' },
+                timestamp: new Date().toISOString()
+            }]
+        }
+    };
+}
+
+// /user status command handler
+async function handleUserStatusCommand(args) {
+    const userId = args.userId;
+
+    if (!userId) {
+        return {
+            type: 4,
+            data: { content: '❌ Unable to identify user.' }
+        };
+    }
+
+    const isLinked = await isDiscordUserLinked(userId);
+
+    if (isLinked) {
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '👤 Account Status',
+                    description: 'Your Discord account is linked to projectmeridus.',
+                    color: EmbedColors.SUCCESS,
+                    fields: [
+                        { name: 'Discord ID', value: `\`${userId}\``, inline: true },
+                        { name: 'GitHub Link', value: '🟢 Connected', inline: true },
+                        { name: 'Token Status', value: '✅ Active', inline: true },
+                    ],
+                    footer: { text: 'Your GitHub token is securely stored' }
+                }]
+            }
+        };
+    }
+
+    return {
+        type: 4,
+        data: {
+            embeds: [{
+                title: '👤 Account Status',
+                description: 'Your Discord account is not linked to projectmeridus.',
+                color: EmbedColors.WARNING,
+                fields: [
+                    { name: 'Discord ID', value: `\`${userId}\``, inline: true },
+                    { name: 'GitHub Link', value: '🔴 Not Connected', inline: true },
+                ],
+                footer: { text: 'Use /user link to connect your account' }
+            }]
+        }
+    };
+}
+
+// ============================================
+// NEW FEATURES - ProjectMeridus Integration
+// ============================================
+
+// /issue create command - Create GitHub issues from Discord
+async function handleIssueCreateCommand(args, userId) {
+    const repoInput = args.repo;
+    const title = args.title;
+    const body = args.body || '';
+    const labels = args.labels || '';
+    
+    if (!repoInput || !title) {
+        return {
+            type: 4,
+            data: { content: '❌ Usage: /issue create <repo> <title> [body] [labels]' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        const issueData = {
+            title: title,
+            body: body + (userId ? `\n\n_Created via MeridusBot by Discord user_` : ''),
+        };
+
+        if (labels) {
+            issueData.labels = labels.split(',').map(l => l.trim());
+        }
+
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'MeridusBot/1.0'
+            },
+            body: JSON.stringify(issueData)
+        });
+
+        if (response.status === 401) {
+            return {
+                type: 4,
+                data: { content: '🔒 GitHub token expired or lacks permissions.' }
+            };
+        }
+
+        if (response.status === 403) {
+            return {
+                type: 4,
+                data: { content: '🔒 Insufficient permissions to create issues in this repository.' }
+            };
+        }
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            return {
+                type: 4,
+                data: { content: `❌ Failed to create issue: ${errorData.message || `HTTP ${response.status}`}` }
+            };
+        }
+
+        const data = await response.json();
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '✅ Issue Created',
+                    description: `[#${data.number}](${data.html_url}) **${data.title}**`,
+                    color: EmbedColors.SUCCESS,
+                    fields: [
+                        { name: 'Repository', value: `${owner}/${repo}`, inline: true },
+                        { name: 'State', value: data.state, inline: true },
+                        { name: 'Labels', value: data.labels?.map(l => `\`${l.name}\``).join(', ') || 'None', inline: true },
+                    ],
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /release command - List repository releases
+async function handleReleaseCommand(args) {
+    const repoInput = args.repo;
+    const limit = Math.min(args.limit || 5, 10);
+    
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=${limit}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+            };
+        }
+
+        const releases = await response.json();
+
+        if (releases.length === 0) {
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: `🚀 Releases: ${owner}/${repo}`,
+                        description: '📭 No releases found for this repository.',
+                        color: EmbedColors.WARNING,
+                        url: `https://github.com/${owner}/${repo}/releases`
+                    }]
+                }
+            };
+        }
+
+        const releaseList = releases.map(r => {
+            const emoji = r.prerelease ? '🧪' : '🚀';
+            const date = formatDate(r.published_at);
+            const name = r.name || r.tag_name;
+            return `${emoji} [${name}](${r.html_url}) \`${r.tag_name}\`\n   Released: ${date}${r.prerelease ? ' • Pre-release' : ''}`;
+        }).join('\n\n');
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `🚀 Releases: ${owner}/${repo}`,
+                    description: releaseList,
+                    color: EmbedColors.INFO,
+                    footer: { text: `Showing ${releases.length} releases` },
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /branch command - List repository branches
+async function handleBranchCommand(args) {
+    const repoInput = args.repo;
+    const limit = Math.min(args.limit || 10, 20);
+    
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        // Get default branch info first
+        const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        let defaultBranch = 'main';
+        if (repoResponse.ok) {
+            const repoData = await repoResponse.json();
+            defaultBranch = repoData.default_branch;
+        }
+
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=${limit}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+            };
+        }
+
+        const branches = await response.json();
+
+        if (branches.length === 0) {
+            return {
+                type: 4,
+                data: { content: '📭 No branches found.' }
+            };
+        }
+
+        const branchList = branches.map(b => {
+            const isDefault = b.name === defaultBranch;
+            const protectedEmoji = b.protected ? '🔒' : '';
+            const defaultEmoji = isDefault ? '⭐' : '🌿';
+            return `${defaultEmoji} \`${b.name}\`${isDefault ? ' (default)' : ''} ${protectedEmoji}`;
+        }).join('\n');
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `🌿 Branches: ${owner}/${repo}`,
+                    description: branchList,
+                    color: EmbedColors.INFO,
+                    fields: [
+                        { name: 'Default Branch', value: `\`${defaultBranch}\``, inline: true },
+                        { name: 'Protected', value: branches.filter(b => b.protected).length.toString(), inline: true },
+                    ],
+                    footer: { text: `Showing ${branches.length} branches` },
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /contributors command - Show repository contributors
+async function handleContributorsCommand(args) {
+    const repoInput = args.repo;
+    const limit = Math.min(args.limit || 10, 20);
+    
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contributors?per_page=${limit}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'User-Agent': 'MeridusBot/1.0'
+            }
+        });
+
+        if (response.status === 404) {
+            return {
+                type: 4,
+                data: { content: '❌ Repository not found.' }
+            };
+        }
+
+        if (response.status === 403) {
+            return {
+                type: 4,
+                data: { content: '🔒 Contributor data is not available for this repository.' }
+            };
+        }
+
+        if (!response.ok) {
+            return {
+                type: 4,
+                data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+            };
+        }
+
+        const contributors = await response.json();
+
+        if (contributors.length === 0) {
+            return {
+                type: 4,
+                data: { content: '📭 No contributors found.' }
+            };
+        }
+
+        const contributorList = contributors.map((c, i) => {
+            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '•';
+            return `${medal} [${c.login}](${c.html_url}) - **${formatNumber(c.contributions)}** contributions`;
+        }).join('\n');
+
+        const totalContributions = contributors.reduce((sum, c) => sum + c.contributions, 0);
+
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `👥 Top Contributors: ${owner}/${repo}`,
+                    description: contributorList,
+                    color: EmbedColors.INFO,
+                    thumbnail: { url: contributors[0]?.avatar_url },
+                    fields: [
+                        { name: 'Total Contributors', value: formatNumber(contributors.length), inline: true },
+                        { name: 'Total Contributions', value: formatNumber(totalContributions), inline: true },
+                    ],
+                    footer: { text: `Showing top ${contributors.length} contributors` },
+                    timestamp: new Date().toISOString()
+                }]
+            }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// /workflow command - List and trigger workflows
+async function handleWorkflowCommand(args) {
+    const repoInput = args.repo;
+    const action = args.action || 'list';
+    
+    if (!repoInput) {
+        return {
+            type: 4,
+            data: { content: '❌ Please provide a repository (format: owner/repo)' }
+        };
+    }
+
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return {
+            type: 4,
+            data: { content: '❌ Invalid repository format. Use: owner/repo' }
+        };
+    }
+
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return {
+            type: 4,
+            data: { content: '🔒 GitHub token not configured.' }
+        };
+    }
+
+    try {
+        if (action === 'list') {
+            // List workflows
+            const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                    'User-Agent': 'MeridusBot/1.0'
+                }
+            });
+
+            if (response.status === 404) {
+                return {
+                    type: 4,
+                    data: { content: '❌ Repository not found.' }
+                };
+            }
+
+            if (!response.ok) {
+                return {
+                    type: 4,
+                    data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+                };
+            }
+
+            const data = await response.json();
+            const workflows = data.workflows || [];
+
+            if (workflows.length === 0) {
+                return {
+                    type: 4,
+                    data: {
+                        embeds: [{
+                            title: `⚙️ Workflows: ${owner}/${repo}`,
+                            description: '📭 No GitHub Actions workflows found.',
+                            color: EmbedColors.WARNING
+                        }]
+                    }
+                };
+            }
+
+            const workflowList = workflows.map(w => {
+                const stateEmoji = w.state === 'active' ? '🟢' : w.state === 'disabled_manually' ? '🔴' : '🟡';
+                return `${stateEmoji} [${w.name}](${w.html_url})\n   State: ${w.state} • ID: \`${w.id}\``;
+            }).join('\n\n');
+
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: `⚙️ GitHub Actions Workflows: ${owner}/${repo}`,
+                        description: workflowList,
+                        color: EmbedColors.INFO,
+                        footer: { text: `${workflows.length} workflows` },
+                        timestamp: new Date().toISOString()
+                    }]
+                }
+            };
+        } else if (action === 'runs') {
+            // List recent runs
+            const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=5`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                    'User-Agent': 'MeridusBot/1.0'
+                }
+            });
+
+            if (!response.ok) {
+                return {
+                    type: 4,
+                    data: { content: `❌ GitHub API error: HTTP ${response.status}` }
+                };
+            }
+
+            const data = await response.json();
+            const runs = data.workflow_runs || [];
+
+            if (runs.length === 0) {
+                return {
+                    type: 4,
+                    data: { content: '📭 No recent workflow runs.' }
+                };
+            }
+
+            const runList = runs.map(r => {
+                const conclusionEmoji = r.conclusion === 'success' ? '✅' : 
+                                       r.conclusion === 'failure' ? '❌' : 
+                                       r.conclusion === 'cancelled' ? '🚫' : '🟡';
+                return `${conclusionEmoji} [${r.name}](${r.html_url}) #${r.run_number}\n   Branch: \`${r.head_branch}\` • ${formatDate(r.created_at)}`;
+            }).join('\n\n');
+
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: `🔧 Recent Workflow Runs: ${owner}/${repo}`,
+                        description: runList,
+                        color: EmbedColors.INFO,
+                        footer: { text: `Showing ${runs.length} recent runs` },
+                        timestamp: new Date().toISOString()
+                    }]
+                }
+            };
+        }
+
+        return {
+            type: 4,
+            data: { content: '❌ Unknown action. Use: list, runs' }
+        };
+    } catch (err) {
+        return {
+            type: 4,
+            data: { content: `❌ Error: ${err.message}` }
+        };
+    }
+}
+
+// ============================================
 // GitHub Event Handler
 // ============================================
 
@@ -610,6 +2433,9 @@ function createGitHubEmbed(event, payload) {
         watch: 0xE3B341,
         create: 0x238636,
         delete: 0xF85149,
+        workflow_run: 0x4A9EFF,
+        discussion: 0x8257E5,
+        pull_request_review: 0x238636,
     };
     
     const emojiMap = {
@@ -622,6 +2448,11 @@ function createGitHubEmbed(event, payload) {
         watch: '⭐',
         create: '✨',
         delete: '🗑️',
+        workflow_run: '⚙️',
+        workflow_job: '🔧',
+        discussion: '💭',
+        discussion_comment: '💬',
+        pull_request_review: '👁️',
     };
     
     const embed = {
@@ -693,6 +2524,171 @@ function createGitHubEmbed(event, payload) {
                     value: release.body.substring(0, 200)
                 });
             }
+            break;
+            
+        // NEW EVENT HANDLERS
+        
+        case 'workflow_run':
+            const wfRun = payload.workflow_run;
+            const wfConclusion = wfRun.conclusion;
+            const statusEmoji = wfConclusion === 'success' ? '✅' : 
+                               wfConclusion === 'failure' ? '❌' : 
+                               wfConclusion === 'cancelled' ? '🚫' : '🟡';
+            const statusColor = wfConclusion === 'success' ? 0x238636 : 
+                               wfConclusion === 'failure' ? 0xF85149 : 
+                               wfConclusion === 'cancelled' ? 0xE3B341 : 0x6E7681;
+            
+            embed.title = `${emojiMap.workflow_run} Workflow ${wfRun.status === 'completed' ? wfRun.conclusion : wfRun.status}: ${wfRun.name}`;
+            embed.url = wfRun.html_url;
+            embed.color = statusColor;
+            embed.fields = [
+                { name: 'Repository', value: repo.full_name, inline: true },
+                { name: 'Branch', value: `\`${wfRun.head_branch}\``, inline: true },
+                { name: 'Triggered by', value: payload.sender?.login || 'Unknown', inline: true },
+                { name: 'Commit', value: `\`${wfRun.head_sha?.substring(0, 7)}\``, inline: true },
+                { name: 'Run Number', value: `#${wfRun.run_number}`, inline: true },
+            ];
+            if (wfRun.conclusion === 'failure' && wfRun.run_attempt > 1) {
+                embed.fields.push({ 
+                    name: 'Attempt', 
+                    value: `${wfRun.run_attempt}`, 
+                    inline: true 
+                });
+            }
+            break;
+            
+        case 'workflow_job':
+            const job = payload.workflow_job;
+            const jobStatus = job.conclusion || job.status;
+            const jobEmoji = jobStatus === 'success' ? '✅' : 
+                            jobStatus === 'failure' ? '❌' : 
+                            jobStatus === 'cancelled' ? '🚫' : '🔧';
+            embed.title = `${jobEmoji} Job ${jobStatus}: ${job.name}`;
+            embed.url = job.html_url;
+            embed.color = jobStatus === 'success' ? 0x238636 : 
+                         jobStatus === 'failure' ? 0xF85149 : 0x6E7681;
+            embed.fields = [
+                { name: 'Workflow', value: job.workflow_name || 'Unknown', inline: true },
+                { name: 'Repository', value: repo.full_name, inline: true },
+                { name: 'Runner', value: job.runner_name || 'N/A', inline: true },
+            ];
+            if (job.started_at && job.completed_at) {
+                const start = new Date(job.started_at);
+                const end = new Date(job.completed_at);
+                const duration = Math.round((end - start) / 1000);
+                embed.fields.push({ 
+                    name: 'Duration', 
+                    value: `${Math.floor(duration / 60)}m ${duration % 60}s`, 
+                    inline: true 
+                });
+            }
+            break;
+            
+        case 'discussion':
+            const discussion = payload.discussion;
+            const categoryEmoji = discussion.category?.emoji || '💭';
+            embed.title = `${categoryEmoji} Discussion ${payload.action}: ${discussion.title.substring(0, 80)}`;
+            embed.url = discussion.html_url;
+            embed.fields = [
+                { name: 'Author', value: discussion.user?.login || 'Unknown', inline: true },
+                { name: 'Category', value: discussion.category?.name || 'General', inline: true },
+                { name: 'State', value: discussion.state || 'open', inline: true },
+            ];
+            if (discussion.body) {
+                embed.fields.push({
+                    name: 'Preview',
+                    value: discussion.body.substring(0, 150) + (discussion.body.length > 150 ? '...' : '')
+                });
+            }
+            break;
+            
+        case 'discussion_comment':
+            const discComment = payload.comment;
+            const parentDiscussion = payload.discussion;
+            embed.title = `💬 New comment on: ${parentDiscussion?.title?.substring(0, 60) || 'Discussion'}`;
+            embed.url = discComment.html_url;
+            embed.fields = [
+                { name: 'Author', value: discComment.user?.login || 'Unknown', inline: true },
+                { name: 'Discussion', value: `[View](${parentDiscussion?.html_url})`, inline: true },
+            ];
+            if (discComment.body) {
+                embed.fields.push({
+                    name: 'Comment',
+                    value: discComment.body.substring(0, 200) + (discComment.body.length > 200 ? '...' : '')
+                });
+            }
+            break;
+            
+        case 'pull_request_review':
+            const review = payload.review;
+            const reviewPR = payload.pull_request;
+            const reviewStateEmoji = review.state === 'approved' ? '✅' :
+                                    review.state === 'changes_requested' ? '❌' :
+                                    review.state === 'commented' ? '💬' : '👁️';
+            embed.title = `${reviewStateEmoji} PR Review ${review.state}: #${reviewPR.number}`;
+            embed.url = review.html_url;
+            embed.fields = [
+                { name: 'Reviewer', value: review.user?.login || 'Unknown', inline: true },
+                { name: 'PR Title', value: reviewPR.title?.substring(0, 60) || 'Unknown', inline: true },
+                { name: 'State', value: review.state, inline: true },
+            ];
+            if (review.body) {
+                embed.fields.push({
+                    name: 'Review Comment',
+                    value: review.body.substring(0, 200) + (review.body.length > 200 ? '...' : '')
+                });
+            }
+            break;
+            
+        case 'pull_request_review_comment':
+            const prComment = payload.comment;
+            const commentPR = payload.pull_request;
+            embed.title = `💬 Review comment on: #${commentPR.number}`;
+            embed.url = prComment.html_url;
+            embed.fields = [
+                { name: 'Commenter', value: prComment.user?.login || 'Unknown', inline: true },
+                { name: 'File', value: `\`${prComment.path?.split('/').pop() || 'Unknown'}\``, inline: true },
+                { name: 'Line', value: `${prComment.line || 'N/A'}`, inline: true },
+            ];
+            if (prComment.body) {
+                embed.fields.push({
+                    name: 'Comment',
+                    value: prComment.body.substring(0, 200) + (prComment.body.length > 200 ? '...' : '')
+                });
+            }
+            break;
+            
+        case 'create':
+            const refType = payload.ref_type;
+            const refName = payload.ref;
+            const createEmoji = refType === 'tag' ? '🏷️' : '🌿';
+            embed.title = `${createEmoji} ${refType === 'tag' ? 'Tag' : 'Branch'} Created: \`${refName}\``;
+            embed.url = `${repo.html_url}/tree/${refName}`;
+            embed.fields = [
+                { name: 'Type', value: refType, inline: true },
+                { name: 'Name', value: `\`${refName}\``, inline: true },
+                { name: 'Created by', value: payload.sender?.login || 'Unknown', inline: true },
+            ];
+            if (refType === 'branch' && payload.master_branch) {
+                embed.fields.push({ 
+                    name: 'Based on', 
+                    value: `\`${payload.master_branch}\``, 
+                    inline: true 
+                });
+            }
+            break;
+            
+        case 'delete':
+            const delType = payload.ref_type;
+            const delName = payload.ref;
+            const delEmoji = delType === 'tag' ? '🏷️' : '🌿';
+            embed.title = `${delEmoji} ${delType === 'tag' ? 'Tag' : 'Branch'} Deleted: \`${delName}\``;
+            embed.color = 0xF85149;
+            embed.fields = [
+                { name: 'Type', value: delType, inline: true },
+                { name: 'Name', value: `\`${delName}\``, inline: true },
+                { name: 'Deleted by', value: payload.sender?.login || 'Unknown', inline: true },
+            ];
             break;
             
         default:
@@ -813,6 +2809,283 @@ client.once('ready', async () => {
                 },
             ],
         },
+        // NEW COMMANDS
+        {
+            name: 'repo',
+            description: 'Repository information and management',
+            options: [
+                {
+                    name: 'info',
+                    description: 'Show detailed repository information',
+                    type: 1, // SUB_COMMAND
+                    options: [
+                        {
+                            name: 'repo',
+                            description: 'GitHub repository (owner/repo)',
+                            type: 3, // STRING
+                            required: true,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: 'pr',
+            description: 'List open pull requests for a repository',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+            ],
+        },
+        {
+            name: 'star',
+            description: 'Star a GitHub repository',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+            ],
+        },
+        {
+            name: 'watch',
+            description: 'Watch or unwatch a repository',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'action',
+                    description: 'Watch action (toggle/subscribe/unsubscribe)',
+                    type: 3,
+                    required: false,
+                    choices: [
+                        { name: 'Toggle', value: 'toggle' },
+                        { name: 'Subscribe/Watch', value: 'subscribe' },
+                        { name: 'Unsubscribe/Unwatch', value: 'unsubscribe' },
+                    ],
+                },
+            ],
+        },
+        {
+            name: 'webhook',
+            description: 'Check webhook status for a repository',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+            ],
+        },
+        {
+            name: 'merge',
+            description: 'Merge a pull request',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'number',
+                    description: 'Pull request number',
+                    type: 4, // INTEGER
+                    required: true,
+                },
+                {
+                    name: 'method',
+                    description: 'Merge method',
+                    type: 3,
+                    required: false,
+                    choices: [
+                        { name: 'Merge', value: 'merge' },
+                        { name: 'Squash', value: 'squash' },
+                        { name: 'Rebase', value: 'rebase' },
+                    ],
+                },
+            ],
+        },
+        {
+            name: 'search',
+            description: 'Search GitHub',
+            options: [
+                {
+                    name: 'query',
+                    description: 'Search query',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'type',
+                    description: 'Type of search',
+                    type: 3,
+                    required: false,
+                    choices: [
+                        { name: 'Repositories', value: 'repos' },
+                        { name: 'Issues', value: 'issues' },
+                        { name: 'Code', value: 'code' },
+                        { name: 'Users', value: 'users' },
+                        { name: 'Commits', value: 'commits' },
+                    ],
+                },
+            ],
+        },
+        // PROJECTMERIDUS INTEGRATION COMMANDS
+        {
+            name: 'issue',
+            description: 'GitHub issue management',
+            options: [
+                {
+                    name: 'create',
+                    description: 'Create a new issue',
+                    type: 1, // SUB_COMMAND
+                    options: [
+                        {
+                            name: 'repo',
+                            description: 'GitHub repository (owner/repo)',
+                            type: 3,
+                            required: true,
+                        },
+                        {
+                            name: 'title',
+                            description: 'Issue title',
+                            type: 3,
+                            required: true,
+                        },
+                        {
+                            name: 'body',
+                            description: 'Issue body/description',
+                            type: 3,
+                            required: false,
+                        },
+                        {
+                            name: 'labels',
+                            description: 'Comma-separated labels',
+                            type: 3,
+                            required: false,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: 'release',
+            description: 'List repository releases',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'limit',
+                    description: 'Number of releases to show (max 10)',
+                    type: 4,
+                    required: false,
+                },
+            ],
+        },
+        {
+            name: 'branch',
+            description: 'List repository branches',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'limit',
+                    description: 'Number of branches to show (max 20)',
+                    type: 4,
+                    required: false,
+                },
+            ],
+        },
+        {
+            name: 'contributors',
+            description: 'Show repository contributors',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'limit',
+                    description: 'Number of contributors to show (max 20)',
+                    type: 4,
+                    required: false,
+                },
+            ],
+        },
+        {
+            name: 'workflow',
+            description: 'GitHub Actions workflow management',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'GitHub repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+                {
+                    name: 'action',
+                    description: 'Action to perform',
+                    type: 3,
+                    required: false,
+                    choices: [
+                        { name: 'List Workflows', value: 'list' },
+                        { name: 'Recent Runs', value: 'runs' },
+                    ],
+                },
+            ],
+        },
+        // USER ACCOUNT LINKING COMMANDS
+        {
+            name: 'user',
+            description: 'Manage your projectmeridus account link',
+            options: [
+                {
+                    name: 'link',
+                    description: 'Link your Discord account with projectmeridus',
+                    type: 1, // SUB_COMMAND
+                    options: [
+                        {
+                            name: 'token',
+                            description: 'GitHub token (optional - usually linked via website)',
+                            type: 3,
+                            required: false,
+                        },
+                    ],
+                },
+                {
+                    name: 'unlink',
+                    description: 'Unlink your Discord account from projectmeridus',
+                    type: 1, // SUB_COMMAND
+                },
+                {
+                    name: 'status',
+                    description: 'Check your account link status',
+                    type: 1, // SUB_COMMAND
+                },
+            ],
+        },
     ];
     
     try {
@@ -825,16 +3098,18 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isCommand()) return;
-    
+
     const { commandName, options } = interaction;
-    console.log(`[Discord] Command: ${commandName}`);
-    
+    console.log(`[Discord] Command: "${commandName}" (type: ${typeof commandName})`);
+    console.log(`[Discord] Options data:`, options.data);
+
     try {
         const response = await handleSlashCommand(
             commandName,
-            options.data?.map(o => ({ name: o.name, value: o.value, options: o.options })) || [],
+            options.data || [],
             { headers: {} },
-            null
+            null,
+            interaction
         );
         
         if (response) {
