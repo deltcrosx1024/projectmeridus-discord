@@ -301,6 +301,25 @@ async function handleSlashCommand(commandName, options, req, res, interaction = 
                 data: { content: '❌ Unknown subcommand. Use: /user link, /user unlink, /user status' }
             };
 
+        // QOL FEATURES - New Commands
+        case 'help':
+            return await handleHelpCommand(args);
+
+        case 'mystats':
+            return await handleMyStatsCommand(args);
+
+        case 'actions':
+            return await handleActionsCommand(args);
+
+        case 'reviews':
+            return await handleReviewsCommand(args);
+
+        case 'settings':
+            return await handleSettingsCommand(args);
+
+        case 'export':
+            return await handleExportCommand(args);
+
         default:
             console.log(`[DEBUG] Unknown command received: "${commandName}"`);
             console.log(`[DEBUG] Command name length: ${commandName.length}`);
@@ -2383,6 +2402,375 @@ async function handleWorkflowCommand(args) {
 }
 
 // ============================================
+// QOL FEATURES - New Command Handlers
+// ============================================
+
+// In-memory storage for QOL features
+const userPreferences = new Map();
+const commandCooldowns = new Map();
+
+// Default cooldowns in seconds
+const DEFAULT_COOLDOWNS = {
+    repos: 30, issues: 15, commits: 15, pr: 20, search: 10,
+    status: 5, ping: 5, test: 60, mystats: 30, actions: 30, reviews: 20
+};
+
+// Helper: Check cooldown
+function checkCooldown(userId, command) {
+    const key = `${userId}:${command}`;
+    const cooldownSeconds = DEFAULT_COOLDOWNS[command] || 5;
+    const lastUsed = commandCooldowns.get(key);
+    if (!lastUsed) return 0;
+    const elapsed = (Date.now() - lastUsed) / 1000;
+    const remaining = Math.ceil(cooldownSeconds - elapsed);
+    return remaining > 0 ? remaining : 0;
+}
+
+// Helper: Set cooldown
+function setCooldown(userId, command) {
+    commandCooldowns.set(`${userId}:${command}`, Date.now());
+}
+
+// Helper: Get user prefs
+function getUserPrefs(userId) {
+    if (!userPreferences.has(userId)) {
+        userPreferences.set(userId, {
+            dmNotifications: false,
+            digestMode: 'instant',
+            silentMode: null,
+            mutedRepos: [],
+            githubUsername: null
+        });
+    }
+    return userPreferences.get(userId);
+}
+
+// Helper: Format error with suggestion
+function formatErrorWithSuggestion(err, context) {
+    const status = err?.status;
+    if (status === 401) {
+        return '🔒 **GitHub authentication failed**\n\nYour token has expired. Please re-link your account:\n' +
+            `${getBaseUrl()}`;
+    }
+    if (status === 403) {
+        return '⏱️ **Rate limit exceeded**\n\nPlease try again later.';
+    }
+    if (status === 404) {
+        if (context === 'repo') return '❌ **Repository not found**\n\nCheck the format: `owner/repo`';
+        return '❌ **Not found**\n\nThe requested resource does not exist.';
+    }
+    return `❌ **Error**: ${err.message || 'Unknown error'}`;
+}
+
+// 1. Help Command
+async function handleHelpCommand(args) {
+    const cmd = args.command;
+    
+    if (cmd) {
+        const details = {
+            repos: 'List your GitHub repositories with pagination.',
+            issues: 'List open issues across your repositories.',
+            commits: 'Show recent commits.',
+            pr: 'List pull requests for a repository.',
+            search: 'Search GitHub repositories, issues, or code.',
+            subscribe: 'Subscribe a channel to GitHub events (Admin only).',
+            settings: 'Manage your DM notifications, digest mode, etc.',
+            mystats: 'View your GitHub statistics.',
+            actions: 'View GitHub Actions workflow runs.',
+            reviews: 'Show PRs awaiting your review.'
+        };
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `📖 /${cmd} - Help`,
+                    description: details[cmd] || 'No detailed help available.',
+                    color: EmbedColors.INFO
+                }]
+            }
+        };
+    }
+    
+    return {
+        type: 4,
+        data: {
+            embeds: [{
+                title: '📚 MeridusBot Commands',
+                description: 'Use `/help command:<name>` for detailed info.',
+                color: EmbedColors.PRIMARY,
+                fields: [
+                    { name: 'ℹ️ General', value: '`/ping`, `/status`, `/help`', inline: false },
+                    { name: '📁 GitHub', value: '`/repos`, `/issues`, `/commits`, `/pr`, `/search`, `/mystats`, `/actions`, `/reviews`', inline: false },
+                    { name: '🔔 Subscriptions', value: '`/subscribe`, `/unsubscribe`, `/list`', inline: false },
+                    { name: '⚙️ Settings', value: '`/settings`, `/export`', inline: false }
+                ]
+            }]
+        }
+    };
+}
+
+// 2. MyStats Command
+async function handleMyStatsCommand(args) {
+    const userId = args.userId;
+    const remaining = checkCooldown(userId, 'mystats');
+    if (remaining > 0) {
+        return { type: 4, data: { content: `⏱️ Please wait ${remaining}s before using this command again.`, flags: 64 } };
+    }
+    setCooldown(userId, 'mystats');
+    
+    const token = await getGitHubToken(userId);
+    if (!token) {
+        return { type: 4, data: { content: '🔒 GitHub not linked. Please log in at ' + getBaseUrl() } };
+    }
+    
+    try {
+        const response = await fetch('https://api.github.com/user', {
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' }
+        });
+        
+        if (!response.ok) throw { status: response.status };
+        
+        const user = await response.json();
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `📊 Stats for ${user.login}`,
+                    color: EmbedColors.PRIMARY,
+                    thumbnail: { url: user.avatar_url },
+                    fields: [
+                        { name: '📁 Public Repos', value: user.public_repos.toString(), inline: true },
+                        { name: '👥 Followers', value: user.followers.toString(), inline: true },
+                        { name: '👤 Following', value: user.following.toString(), inline: true },
+                        { name: '📅 Joined', value: new Date(user.created_at).toLocaleDateString(), inline: true },
+                        { name: '🏢 Company', value: user.company || 'N/A', inline: true },
+                        { name: '📍 Location', value: user.location || 'N/A', inline: true }
+                    ]
+                }]
+            }
+        };
+    } catch (err) {
+        return { type: 4, data: { content: formatErrorWithSuggestion(err, 'user') } };
+    }
+}
+
+// 3. Actions Command
+async function handleActionsCommand(args) {
+    const repoInput = args.repo;
+    
+    if (!repoInput) {
+        return { type: 4, data: { content: '❌ Please provide a repository (format: owner/repo)' } };
+    }
+    
+    const parsed = parseRepoInput(repoInput);
+    if (!parsed) {
+        return { type: 4, data: { content: '❌ Invalid repository format. Use: owner/repo' } };
+    }
+    
+    const { owner, repo } = parsed;
+    const token = await getGitHubToken(args.userId);
+    
+    if (!token) {
+        return { type: 4, data: { content: '🔒 GitHub token not configured.' } };
+    }
+    
+    try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=5`, {
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' }
+        });
+        
+        if (!response.ok) throw { status: response.status };
+        
+        const data = await response.json();
+        const runs = data.workflow_runs || [];
+        
+        if (runs.length === 0) {
+            return { type: 4, data: { content: `🔧 No recent workflow runs in **${owner}/${repo}**.` } };
+        }
+        
+        const runList = runs.map(r => {
+            const emoji = r.conclusion === 'success' ? '✅' : r.conclusion === 'failure' ? '❌' : '⏳';
+            return `${emoji} **${r.name}** - ${r.head_branch} (${r.event})`;
+        }).join('\n');
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: `🔧 Recent Actions in ${owner}/${repo}`,
+                    description: runList,
+                    color: EmbedColors.INFO,
+                    footer: { text: 'Last 5 workflow runs' }
+                }]
+            }
+        };
+    } catch (err) {
+        return { type: 4, data: { content: formatErrorWithSuggestion(err, 'actions') } };
+    }
+}
+
+// 4. Reviews Command
+async function handleReviewsCommand(args) {
+    const userId = args.userId;
+    const token = await getGitHubToken(userId);
+    
+    if (!token) {
+        return { type: 4, data: { content: '🔒 GitHub not linked.' } };
+    }
+    
+    try {
+        // Get current user
+        const userRes = await fetch('https://api.github.com/user', {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const user = await userRes.json();
+        
+        // Search for PRs awaiting review
+        const searchRes = await fetch(`https://api.github.com/search/issues?q=is:pr+is:open+review-requested:${user.login}&per_page=10`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        
+        if (!searchRes.ok) throw { status: searchRes.status };
+        
+        const searchData = await searchRes.json();
+        const prs = searchData.items || [];
+        
+        if (prs.length === 0) {
+            return { type: 4, data: { content: '🎉 No pull requests awaiting your review!' } };
+        }
+        
+        const prList = prs.map(p => {
+            const repo = p.repository_url?.split('/').slice(-2).join('/') || 'unknown';
+            return `• **${repo}#${p.number}** ${p.title}`;
+        }).join('\n');
+        
+        return {
+            type: 4,
+            data: {
+                embeds: [{
+                    title: '👀 Review Requests',
+                    description: prList,
+                    color: EmbedColors.WARNING,
+                    footer: { text: `${prs.length} PRs awaiting review` }
+                }]
+            }
+        };
+    } catch (err) {
+        return { type: 4, data: { content: formatErrorWithSuggestion(err, 'reviews') } };
+    }
+}
+
+// 5. Settings Command
+async function handleSettingsCommand(args) {
+    const userId = args.userId;
+    if (!userId) {
+        return { type: 4, data: { content: '❌ Could not identify user.' } };
+    }
+    
+    const action = args.action || 'view';
+    const value = args.value || '';
+    const prefs = getUserPrefs(userId);
+    
+    switch (action) {
+        case 'view': {
+            const silentStatus = prefs.silentMode?.enabled 
+                ? `🔇 Until ${new Date(prefs.silentMode.until).toLocaleString()}` 
+                : '🔊 Off';
+            
+            return {
+                type: 4,
+                data: {
+                    embeds: [{
+                        title: '⚙️ Your Settings',
+                        color: EmbedColors.INFO,
+                        fields: [
+                            { name: '📩 DM Notifications', value: prefs.dmNotifications ? '✅ Enabled' : '❌ Disabled', inline: true },
+                            { name: '📊 Digest Mode', value: prefs.digestMode, inline: true },
+                            { name: '🔇 Silent Mode', value: silentStatus, inline: true },
+                            { name: '🔗 GitHub Username', value: prefs.githubUsername || 'Not set', inline: true },
+                            { name: '🔕 Muted Repos', value: prefs.mutedRepos.length > 0 ? prefs.mutedRepos.join(', ') : 'None', inline: false }
+                        ]
+                    }]
+                }
+            };
+        }
+        
+        case 'dm': {
+            prefs.dmNotifications = !prefs.dmNotifications;
+            return { type: 4, data: { content: `📩 DM notifications ${prefs.dmNotifications ? '✅ enabled' : '❌ disabled'}.` } };
+        }
+        
+        case 'digest': {
+            if (!['instant', 'hourly', 'daily'].includes(value)) {
+                return { type: 4, data: { content: '❌ Invalid mode. Use: instant, hourly, or daily' } };
+            }
+            prefs.digestMode = value;
+            return { type: 4, data: { content: `📊 Digest mode set to **${value}**.` } };
+        }
+        
+        case 'silent_on': {
+            const duration = parseInt(value) || 60;
+            const until = new Date();
+            until.setMinutes(until.getMinutes() + duration);
+            prefs.silentMode = { enabled: true, until: until.toISOString() };
+            return { type: 4, data: { content: `🔇 Silent mode enabled for ${duration} minutes.` } };
+        }
+        
+        case 'silent_off': {
+            prefs.silentMode = { enabled: false, until: null };
+            return { type: 4, data: { content: '🔊 Silent mode disabled.' } };
+        }
+        
+        case 'mute': {
+            if (!value) return { type: 4, data: { content: '❌ Please specify a repository to mute.' } };
+            if (!prefs.mutedRepos.includes(value.toLowerCase())) {
+                prefs.mutedRepos.push(value.toLowerCase());
+            }
+            return { type: 4, data: { content: `🔕 Muted **${value}**.` } };
+        }
+        
+        case 'unmute': {
+            if (!value) return { type: 4, data: { content: '❌ Please specify a repository to unmute.' } };
+            prefs.mutedRepos = prefs.mutedRepos.filter(r => r !== value.toLowerCase());
+            return { type: 4, data: { content: `🔔 Unmuted **${value}**.` } };
+        }
+        
+        case 'github_user': {
+            if (!value) return { type: 4, data: { content: '❌ Please specify your GitHub username.' } };
+            prefs.githubUsername = value;
+            return { type: 4, data: { content: `🔗 GitHub username set to **${value}**.` } };
+        }
+        
+        default:
+            return { type: 4, data: { content: '❌ Unknown action. Use: view, dm, digest, silent_on, silent_off, mute, unmute, github_user' } };
+    }
+}
+
+// 6. Export Command
+async function handleExportCommand(args) {
+    // Check permissions (Admin only)
+    // Note: In original code, permissions would be checked in switch case
+    
+    const data = {
+        exported_at: new Date().toISOString(),
+        subscriptions: Array.from(botState.subscriptions.entries()).map(([channelId, sub]) => ({
+            channelId,
+            ...sub
+        }))
+    };
+    
+    return {
+        type: 4,
+        data: {
+            content: `📤 **${data.subscriptions.length} subscription(s) exported.**\n\`\`\`json\n${JSON.stringify(data, null, 2).substring(0, 1900)}\`\`\``,
+            flags: 64
+        }
+    };
+}
+
+// ============================================
 // GitHub Event Handler
 // ============================================
 
@@ -3085,6 +3473,81 @@ client.once('ready', async () => {
                     type: 1, // SUB_COMMAND
                 },
             ],
+        },
+        // QOL FEATURES - New Commands
+        {
+            name: 'help',
+            description: 'Show help information for commands',
+            options: [
+                {
+                    name: 'command',
+                    description: 'Get detailed help for a specific command',
+                    type: 3,
+                    required: false,
+                    choices: [
+                        { name: 'repos', value: 'repos' },
+                        { name: 'issues', value: 'issues' },
+                        { name: 'commits', value: 'commits' },
+                        { name: 'pr', value: 'pr' },
+                        { name: 'search', value: 'search' },
+                        { name: 'settings', value: 'settings' },
+                        { name: 'mystats', value: 'mystats' },
+                    ],
+                },
+            ],
+        },
+        {
+            name: 'mystats',
+            description: 'Show your GitHub statistics',
+        },
+        {
+            name: 'actions',
+            description: 'Show GitHub Actions workflow runs',
+            options: [
+                {
+                    name: 'repo',
+                    description: 'Repository (owner/repo)',
+                    type: 3,
+                    required: true,
+                },
+            ],
+        },
+        {
+            name: 'reviews',
+            description: 'Show pull requests awaiting your review',
+        },
+        {
+            name: 'settings',
+            description: 'Manage your bot settings',
+            options: [
+                {
+                    name: 'action',
+                    description: 'Setting to change',
+                    type: 3,
+                    required: true,
+                    choices: [
+                        { name: 'View settings', value: 'view' },
+                        { name: 'Toggle DM notifications', value: 'dm' },
+                        { name: 'Set digest mode', value: 'digest' },
+                        { name: 'Enable silent mode', value: 'silent_on' },
+                        { name: 'Disable silent mode', value: 'silent_off' },
+                        { name: 'Mute repository', value: 'mute' },
+                        { name: 'Unmute repository', value: 'unmute' },
+                        { name: 'Set GitHub username', value: 'github_user' },
+                    ],
+                },
+                {
+                    name: 'value',
+                    description: 'Value for the setting',
+                    type: 3,
+                    required: false,
+                },
+            ],
+        },
+        {
+            name: 'export',
+            description: 'Export all subscriptions as JSON (Admin only)',
+            default_member_permissions: '8', // Administrator
         },
     ];
     
